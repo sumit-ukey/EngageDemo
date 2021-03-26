@@ -1,0 +1,213 @@
+//webhook test script 
+
+def stepflag  = false;
+
+pipeline {
+
+    // Run on any agent 
+    agent any 
+
+    // tools
+
+    // will receive generic trigger from GitHub when code is merged in to dev/monthly branch
+    
+    triggers {
+        GenericTrigger(
+        genericVariables: [
+            [ key: 'committer_name', value: '$.head_commit.committer.name' ],
+            [ key: 'committer_email', value: '$.head_commit.committer.email' ],
+            [ key: 'release_type', value: '$.ref', regexpFilter: 'refs/heads/'],
+            [ key: 'ref_type', value: '$.ref_type' ],   
+            [ key: 'base_ref', value: '$.base_ref' ],  
+            [ key: 'sender', value: '$.sender.login' ],        
+            [ key: 'commit', value: '$.head_commit.id' ],
+            [ key: 'message', value: '$.head_commit.message' ],
+            [ key: 'action', value: '$.action' ],
+            [ key: 'target_commitish', value: '$.release.target_commitish' ]
+            
+            ],
+            //causeString: 'Triggered on $ref',
+            causeString: '$committer_name pushed - referencing $commit',
+            token: 'testToken',
+            regexpFilterExpression: '',
+            regexpFilterText: '',
+            printContributedVariables: true,
+            printPostContent: true
+        )
+    }
+    
+
+    // set environment variables
+    environment { 
+        release_type = "${release_type}"        
+        committer_name = "${committer_name}"
+        committer_email = "${committer_email}"
+        commit = "${commit}"
+        ref_type = "${ref_type}"
+        base_ref = "${base_ref}"
+        sender = "${sender}"
+        message = "${message}"
+        action = "${action}"
+        target_commitish = "${target_commitish}"
+    }
+
+    // set parameters
+
+    // stages to Initialize, Build Monthly Branch either through manual or webhook
+    stages 
+    {
+        stage ('Initialize'){
+            steps {
+                echo "Workspace ${WORKSPACE}"
+                echo "REPO_KEY ${env.REPO_KEY}" 
+                echo "Webhook Generic Variables"
+                
+                echo "genericVariables release_type = ${release_type} "
+                echo "genericVariables base_ref = ${base_ref} "
+                echo "genericVariables committer_name = ${committer_name} "
+                echo "genericVariables committer_email = ${committer_email} "
+                echo "genericVariables commit = ${commit} "
+                echo "genericVariables sender = ${sender} "
+                echo "genericVariables message = ${message} "
+                echo "genericVariables action = ${action} "
+            }
+        }
+
+        stage ('Build Release Source'){
+            when {
+                expression { release_type == 'master' }
+            }
+            steps {
+                ws(WORKSPACE){
+                   
+                    echo "Call Build Release Source" 
+                    script { 
+                        def buildjob = build job: 'BuildReleaseSource', parameters: [[$class: 'StringParameterValue', name: 'REQUESTED_ACTION', value: 'Build']]
+                        echo "${buildjob.getResult()}"
+                    }
+                }
+            }
+        }
+
+       
+    }
+
+    // post will execute in all secnarios, send email to configures recipents
+    post {
+        always {
+            echo "Release Build Results"
+            echo "${env.BUILD_URL} has result  ${currentBuild.result}."
+        }
+        success {
+            //echo "Status of pipeline ${currentBuild.fullDisplayName}"
+            // For each branch push and tag will fire this webhook and team will recevie many emails
+            // currently commented.
+            echo "webhook success"
+            /* 
+            emailext body: 'Automated Webhook Build Run ', 
+                    to: "${DEFAULT_RECIPIENTS}", 
+                    from: "${DEFAULT_EMAIL_FROM}",                    
+                    subject: 'CI/CD Job completed successfully: $PROJECT_NAME - #$BUILD_NUMBER ' + getRunDate() 
+            */
+        }
+        unstable {
+            echo "${env.BUILD_URL} has result unstable."
+           
+            emailext body: 'Check console output at $BUILD_URL to view the results. \n\n ${CHANGES} \n\n -------------------------------------------------- \n${BUILD_LOG, maxLines=100, escapeHtml=false}', 
+                    to: "${DEFAULT_RECIPIENTS}",
+                    from: "${DEFAULT_EMAIL_FROM}",
+                    subject: 'Unstable build in Jenkins: $PROJECT_NAME - #$BUILD_NUMBER'
+        }
+        failure {
+            echo "${env.BUILD_URL} has result fail."
+         
+            emailext body: 'Check console output at $BUILD_URL to view the results. \n\n ${CHANGES} \n\n -------------------------------------------------- \n${BUILD_LOG, maxLines=100, escapeHtml=false}', 
+                    to: "${DEFAULT_RECIPIENTS}",
+                    from: "${DEFAULT_EMAIL_FROM}",
+                    subject: 'CI/CD Job failed : $PROJECT_NAME - #$BUILD_NUMBER' + getRunDate() 
+            
+        }
+        changed {
+            script {
+                if (currentBuild.currentResult == 'FAILURE') { // Other values: SUCCESS, UNSTABLE
+                    // Send an email only if the build status has changed from green/unstable to red
+                    emailext subject: '$DEFAULT_SUBJECT',
+                        body: '$DEFAULT_CONTENT',
+                        recipientProviders: [
+                            [$class: 'CulpritsRecipientProvider'],
+                            [$class: 'DevelopersRecipientProvider'],
+                            [$class: 'RequesterRecipientProvider']
+                        ], 
+                        replyTo: '$DEFAULT_REPLYTO',                         
+                        to: '$DEFAULT_RECIPIENTS'
+                }
+                if (currentBuild.currentResult == 'SUCCESS') {
+                    emailext body: 'Check console output at $BUILD_URL to view the results.',
+                    to: "${DEFAULT_RECIPIENTS}", 
+                    from: "${DEFAULT_EMAIL_FROM}",
+                    subject: 'Jenkins build is back to normal: $PROJECT_NAME - #$BUILD_NUMBER'
+                }
+            }
+        }
+    }
+}
+
+def getRunDate(){
+    script {     
+        DATE_TAG = java.time.LocalDate.now().format(java.time.format.DateTimeFormatter.ofPattern("MM/dd/yyyy"));
+    }
+    return "${DATE_TAG}"
+}
+
+
+// Generate change log string
+def getChangeString() {
+    MAX_MSG_LEN = 100000
+    def changeString = ""
+    def changeSet = getChangeSet()
+    def changeLog = getChangeLog()
+
+    echo "Gathering SCM changes"
+    echo changeSet
+    echo changeLog
+    def changeLogSets = currentBuild.changeSets
+    for (int i = 0; i < changeLogSets.size(); i++) {
+        def entries = changeLogSets[i].items
+        for (int j = 0; j < entries.length; j++) {
+            def entry = entries[j]
+            truncated_msg = entry.msg.take(MAX_MSG_LEN)
+            changeString += " - ${truncated_msg} [${entry.author}]\n"
+        }
+    }
+
+    if (!changeString) {
+        changeString = " - No new changes"
+    }
+    return changeString
+}
+
+// Generate change set
+def getChangeSet() {
+    return command(returnStdout: true, script: 'git diff-tree --no-commit-id --name-status -r HEAD').trim()
+}
+
+// Generate change log
+def getChangeLog() {
+    return command(returnStdout: true, script: "git log --date=short ").trim()
+}
+
+// send email
+def sendEmail(status) {
+    mail (
+    to: "$DEFAULT_RECIPIENTS", 
+    subject: "Build $BUILD_NUMBER - " + status + " ($JOB_NAME)", 
+    body: "Changes:\n " + getChangeString() + "\n\n Check console output at: $BUILD_URL/console" + "\n")
+}
+
+def command(script) {
+    if (isUnix()) {
+        return sh(returnStatus: true, script: script);
+    } else {
+        return bat(returnStatus: true, script: script);
+    }
+}
